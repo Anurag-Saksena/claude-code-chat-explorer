@@ -2,10 +2,15 @@ const chalk = require('chalk');
 const fs = require('fs-extra');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 const { exec } = require('child_process');
 const { promisify } = require('util');
 const execAsync = promisify(exec);
 const QRCode = require('qrcode');
+
+// Max length of an encoded project directory name before Claude Code
+// truncates and appends a hash. Mirrors the constant in the Claude Code bundle.
+const PROJECT_NAME_MAX = 200;
 
 /**
  * SessionSharing - Handles exporting Claude Code sessions as downloadable context
@@ -438,6 +443,369 @@ class SessionSharing {
         command: command
       };
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Lossless session export / import (resume on another machine)
+  //
+  // Unlike exportSessionAsMarkdown/exportSessionData (which are lossy and drop the
+  // fields Claude Code needs to reconstruct a session), these copy the original
+  // JSONL transcript verbatim and, on import, rewrite only the machine-specific
+  // fields (`cwd`, `sessionId`) so `claude --resume <id>` works on the target.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Compute the ~/.claude/projects folder name Claude Code derives from a cwd.
+   * Mirrors Claude Code's own algorithm exactly: replace every non-alphanumeric
+   * character with '-', and if the result exceeds PROJECT_NAME_MAX chars, truncate
+   * and append a base-36 hash of the ORIGINAL (untruncated) path.
+   * @param {string} cwd - Absolute working directory path
+   * @returns {string} Encoded directory name (e.g. "-Users-jane-my-project")
+   */
+  encodeProjectDirName(cwd) {
+    const encoded = cwd.replace(/[^a-zA-Z0-9]/g, '-');
+    if (encoded.length <= PROJECT_NAME_MAX) {
+      return encoded;
+    }
+    return `${encoded.slice(0, PROJECT_NAME_MAX)}-${SessionSharing.hashPath(cwd)}`;
+  }
+
+  /**
+   * 32-bit string hash matching Claude Code's project-name hashing, base-36 encoded.
+   * @param {string} str - String to hash
+   * @returns {string} Absolute hash in base-36
+   */
+  static hashPath(str) {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
+    }
+    return Math.abs(hash).toString(36);
+  }
+
+  /**
+   * Locate a session's raw JSONL transcript by session id.
+   * Scans ~/.claude/projects/<encoded-cwd>/<id>.jsonl across all projects.
+   * @param {string} sessionId - Session (conversation) id
+   * @returns {Promise<string|null>} Absolute path to the .jsonl file, or null
+   */
+  async findSessionFile(sessionId) {
+    const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
+    if (!(await fs.pathExists(projectsRoot))) {
+      return null;
+    }
+    const projectDirs = await fs.readdir(projectsRoot);
+    for (const dir of projectDirs) {
+      const candidate = path.join(projectsRoot, dir, `${sessionId}.jsonl`);
+      if (await fs.pathExists(candidate)) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Export a session losslessly into a portable package.
+   * Reads the original JSONL transcript verbatim (every field, every line) so it
+   * can be resumed on another machine. Unparseable lines are preserved raw.
+   * @param {Object} params
+   * @param {string} params.filePath - Path to the session .jsonl (optional if sessionId given)
+   * @param {string} params.sessionId - Session id (used to locate file if filePath absent)
+   * @param {string} [params.project] - Human-friendly project label
+   * @returns {Promise<Object>} Portable session package
+   */
+  async exportSessionRaw({ filePath, sessionId, project } = {}) {
+    let resolvedPath = filePath;
+    if (!resolvedPath && sessionId) {
+      resolvedPath = await this.findSessionFile(sessionId);
+    }
+    if (!resolvedPath || !(await fs.pathExists(resolvedPath))) {
+      throw new Error(`Session transcript not found (sessionId=${sessionId || 'n/a'}, filePath=${filePath || 'n/a'})`);
+    }
+
+    const raw = await fs.readFile(resolvedPath, 'utf8');
+    const lines = raw.split('\n');
+
+    const parsedLines = [];
+    let sourceCwd = null;
+    let sourceSessionId = sessionId || null;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const obj = JSON.parse(trimmed);
+        parsedLines.push(obj);
+        if (!sourceCwd && typeof obj.cwd === 'string') sourceCwd = obj.cwd;
+        if (!sourceSessionId && typeof obj.sessionId === 'string') sourceSessionId = obj.sessionId;
+      } catch (e) {
+        // Preserve anything we can't parse so the export stays lossless.
+        parsedLines.push({ __raw: line });
+      }
+    }
+
+    // Fall back to the filename for the session id (files are named <id>.jsonl).
+    if (!sourceSessionId) {
+      sourceSessionId = path.basename(resolvedPath, '.jsonl');
+    }
+
+    // Bundle any subagent (sidechain) transcripts stored under <projectDir>/<sessionId>/
+    const sidechains = await this._collectSidechains(resolvedPath, sourceSessionId);
+
+    return {
+      format: 'claude-code-session',
+      formatVersion: 1,
+      exportedAt: new Date().toISOString(),
+      source: {
+        cwd: sourceCwd,
+        sessionId: sourceSessionId,
+        project: project || (sourceCwd ? path.basename(sourceCwd) : 'session'),
+        lineCount: parsedLines.length
+      },
+      lines: parsedLines,
+      sidechains,
+      metadata: {
+        exportTool: 'claude-code-chat-explorer',
+        exportVersion: require('../package.json').version || '1.0.0',
+        description: 'Lossless Claude Code session export (resumable)'
+      }
+    };
+  }
+
+  /**
+   * Export EVERY local session into a single portable bundle (for transferring an
+   * entire history to another machine). Walks ~/.claude/projects and exports each
+   * top-level transcript losslessly (subagent sidechains included per session).
+   * @returns {Promise<Object>} Bundle { format, sessions: [...] }
+   */
+  async exportAllSessions() {
+    const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
+    const sessions = [];
+    const errors = [];
+
+    if (await fs.pathExists(projectsRoot)) {
+      for (const dir of await fs.readdir(projectsRoot)) {
+        const projectDir = path.join(projectsRoot, dir);
+        const stat = await fs.stat(projectDir).catch(() => null);
+        if (!stat || !stat.isDirectory()) continue;
+
+        // Only top-level *.jsonl files are sessions; sidechains live in <id>/ subdirs
+        // and are bundled by exportSessionRaw, so we must not treat them as sessions.
+        for (const entry of await fs.readdir(projectDir)) {
+          if (!entry.endsWith('.jsonl')) continue;
+          const filePath = path.join(projectDir, entry);
+          const fstat = await fs.stat(filePath).catch(() => null);
+          if (!fstat || !fstat.isFile()) continue;
+          try {
+            const pkg = await this.exportSessionRaw({ filePath });
+            sessions.push(pkg);
+          } catch (e) {
+            errors.push({ file: filePath, error: e.message });
+          }
+        }
+      }
+    }
+
+    return {
+      format: 'claude-code-session-bundle',
+      formatVersion: 1,
+      exportedAt: new Date().toISOString(),
+      sessionCount: sessions.length,
+      sessions,
+      errors,
+      metadata: {
+        exportTool: 'claude-code-chat-explorer',
+        exportVersion: require('../package.json').version || '1.0.0',
+        description: 'Lossless bundle of all Claude Code sessions (resumable)'
+      }
+    };
+  }
+
+  /**
+   * Import a bundle produced by exportAllSessions onto this machine.
+   * Each session is placed back at its ORIGINAL cwd by default (reproducing the
+   * source machine's project layout), optionally remapped via pathMap.
+   * @param {Object} bundle - Bundle from exportAllSessions
+   * @param {Object} options
+   * @param {boolean} [options.keepSessionId=true] - Preserve original ids (default for bundles)
+   * @param {boolean} [options.force=false] - Overwrite existing transcripts
+   * @param {{from:string,to:string}} [options.pathMap] - Remap a cwd path prefix (e.g. old home → new home)
+   * @param {string} [options.targetCwdOverride] - Force all sessions into one cwd (rare)
+   * @returns {Promise<Object>} { imported, skipped, results }
+   */
+  async importBundle(bundle, options = {}) {
+    if (!bundle || !Array.isArray(bundle.sessions)) {
+      throw new Error('Invalid bundle: missing "sessions" array');
+    }
+    const keepSessionId = options.keepSessionId !== false; // default true
+    const results = [];
+    let imported = 0;
+    let skipped = 0;
+
+    for (const pkg of bundle.sessions) {
+      const originalCwd = pkg.source?.cwd;
+      const targetCwd = options.targetCwdOverride
+        || this._remapCwd(originalCwd, options.pathMap);
+
+      if (!targetCwd) {
+        skipped++;
+        results.push({ sessionId: pkg.source?.sessionId, skipped: true, reason: 'no cwd recorded in session' });
+        continue;
+      }
+
+      try {
+        const res = await this.importSession(pkg, {
+          targetCwd,
+          keepSessionId,
+          force: !!options.force
+        });
+        imported++;
+        results.push({ sessionId: res.sessionId, targetCwd: res.targetCwd, sessionFile: res.sessionFile, lineCount: res.lineCount });
+      } catch (e) {
+        skipped++;
+        results.push({ sessionId: pkg.source?.sessionId, skipped: true, reason: e.message });
+      }
+    }
+
+    return { imported, skipped, total: bundle.sessions.length, results };
+  }
+
+  /**
+   * Apply an optional prefix remap to a cwd (e.g. /Users/old → /Users/new).
+   * @param {string} cwd - Original cwd
+   * @param {{from:string,to:string}} [pathMap] - Prefix mapping
+   * @returns {string|null} Remapped cwd, or the original, or null if cwd falsy
+   */
+  _remapCwd(cwd, pathMap) {
+    if (!cwd) return null;
+    if (pathMap && pathMap.from && cwd.startsWith(pathMap.from)) {
+      return path.resolve(pathMap.to + cwd.slice(pathMap.from.length));
+    }
+    return cwd;
+  }
+
+  /**
+   * Collect subagent/sidechain transcripts that live alongside a session, if any.
+   * @param {string} sessionFilePath - Path to the main .jsonl transcript
+   * @param {string} sessionId - Session id
+   * @returns {Promise<Array<{relPath: string, lines: Array}>>}
+   */
+  async _collectSidechains(sessionFilePath, sessionId) {
+    const sideDir = path.join(path.dirname(sessionFilePath), sessionId);
+    if (!(await fs.pathExists(sideDir))) {
+      return [];
+    }
+    const results = [];
+    const walk = async (dir) => {
+      for (const entry of await fs.readdir(dir)) {
+        const full = path.join(dir, entry);
+        const stat = await fs.stat(full);
+        if (stat.isDirectory()) {
+          await walk(full);
+        } else if (entry.endsWith('.jsonl')) {
+          const content = await fs.readFile(full, 'utf8');
+          const lines = content.split('\n')
+            .map(l => l.trim())
+            .filter(Boolean)
+            .map(l => {
+              try { return JSON.parse(l); } catch { return { __raw: l }; }
+            });
+          results.push({ relPath: path.relative(sideDir, full), lines });
+        }
+      }
+    };
+    await walk(sideDir);
+    return results;
+  }
+
+  /**
+   * Import a portable session package onto this machine so it can be resumed.
+   * Rewrites machine-specific fields (`cwd`, `sessionId`) and writes the transcript
+   * into the correct ~/.claude/projects/<encoded-cwd>/ location.
+   * @param {Object} pkg - Package produced by exportSessionRaw (or a raw JSONL array wrapper)
+   * @param {Object} options
+   * @param {string} [options.targetCwd] - Absolute repo path on this machine (default: process.cwd())
+   * @param {boolean} [options.keepSessionId] - Reuse the original id instead of minting a fresh one
+   * @param {boolean} [options.force] - Overwrite if a transcript with the target id already exists
+   * @returns {Promise<Object>} Result { sessionFile, projectDir, sessionId, targetCwd, lineCount }
+   */
+  async importSession(pkg, options = {}) {
+    if (!pkg || !Array.isArray(pkg.lines) || pkg.lines.length === 0) {
+      throw new Error('Invalid session package: no transcript lines found');
+    }
+
+    const targetCwd = path.resolve(options.targetCwd || process.cwd());
+    const originalSessionId = pkg.source?.sessionId
+      || (pkg.lines.find(l => l && typeof l.sessionId === 'string')?.sessionId);
+    const newSessionId = options.keepSessionId && originalSessionId
+      ? originalSessionId
+      : crypto.randomUUID();
+
+    const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
+    const projectDir = path.join(projectsRoot, this.encodeProjectDirName(targetCwd));
+    await fs.ensureDir(projectDir);
+
+    const sessionFile = path.join(projectDir, `${newSessionId}.jsonl`);
+    if ((await fs.pathExists(sessionFile)) && !options.force) {
+      throw new Error(`A session with id ${newSessionId} already exists at ${sessionFile}. Use force to overwrite.`);
+    }
+
+    // Rewrite only machine-specific fields; leave parentUuid/uuid/message/timestamp intact
+    // so Claude Code's parentUuid chain still reconstructs correctly.
+    const rewritten = pkg.lines.map(line => this._rewriteLine(line, targetCwd, newSessionId, originalSessionId));
+    const jsonl = rewritten.map(l => (typeof l === 'string' ? l : JSON.stringify(l))).join('\n') + '\n';
+    await fs.writeFile(sessionFile, jsonl, 'utf8');
+
+    // Restore sidechain (subagent) transcripts under <projectDir>/<newSessionId>/
+    let sidechainCount = 0;
+    if (Array.isArray(pkg.sidechains) && pkg.sidechains.length > 0) {
+      const sideDir = path.join(projectDir, newSessionId);
+      for (const sc of pkg.sidechains) {
+        const dest = path.join(sideDir, sc.relPath);
+        await fs.ensureDir(path.dirname(dest));
+        const lines = (sc.lines || []).map(l =>
+          this._rewriteLine(l, targetCwd, newSessionId, originalSessionId));
+        const content = lines.map(l => (typeof l === 'string' ? l : JSON.stringify(l))).join('\n') + '\n';
+        await fs.writeFile(dest, content, 'utf8');
+        sidechainCount++;
+      }
+    }
+
+    return {
+      success: true,
+      sessionFile,
+      projectDir,
+      sessionId: newSessionId,
+      originalSessionId: originalSessionId || null,
+      targetCwd,
+      lineCount: rewritten.length,
+      sidechainCount
+    };
+  }
+
+  /**
+   * Rewrite machine-specific fields on a single transcript line.
+   * @param {Object|string} line - Parsed line object, or a wrapper {__raw}
+   * @param {string} targetCwd - New working directory
+   * @param {string} newSessionId - New session id
+   * @param {string} originalSessionId - Original session id (for raw-line substitution)
+   * @returns {Object|string} Rewritten line (object) or raw string
+   */
+  _rewriteLine(line, targetCwd, newSessionId, originalSessionId) {
+    if (line && typeof line === 'object' && typeof line.__raw === 'string') {
+      // Best-effort id/cwd swap on lines we couldn't parse.
+      let raw = line.__raw;
+      if (originalSessionId) {
+        raw = raw.split(originalSessionId).join(newSessionId);
+      }
+      return raw;
+    }
+    if (!line || typeof line !== 'object') {
+      return line;
+    }
+    const out = { ...line };
+    if ('cwd' in out) out.cwd = targetCwd;
+    if ('sessionId' in out) out.sessionId = newSessionId;
+    return out;
   }
 
   /**
