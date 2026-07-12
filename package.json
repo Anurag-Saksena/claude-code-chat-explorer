@@ -7,6 +7,7 @@
   "main": "src/chats-mobile.js",
   "scripts": {
     "start": "node src/start.js",
+    "session": "node src/session-io.js",
     "quality:gate": "bash scripts/quality-gate-local.sh",
     "monitor:runtime": "bash scripts/monitor-runtime.sh",
     "test": "vitest run",
