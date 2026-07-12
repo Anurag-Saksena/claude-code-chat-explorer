@@ -2153,6 +2153,13 @@
                         <h1 class="chat-title">Claude Code Chats</h1>
                     </div>
                     <div class="header-right">
+                        <button class="header-btn" id="exportAllBtn" title="Export all sessions as a transfer bundle">
+                            Export All
+                        </button>
+                        <button class="header-btn" id="importBtn" title="Import a session package or transfer bundle onto this machine">
+                            Import
+                        </button>
+                        <input type="file" id="importFileInput" accept=".json,.ccsession.json,.ccbundle.json" style="display:none;" />
                         <button class="header-btn" id="refreshBtn" title="Refresh">
                             Refresh
                         </button>
@@ -2353,6 +2360,16 @@
                                 <line x1="12" y1="15" x2="12" y2="3"></line>
                             </svg>
                             <span>Download</span>
+                        </button>
+                        <button class="action-btn transfer-btn" id="exportSessionTransfer" onclick="exportSessionForTransfer()" title="Export this session as a resumable package to continue on another machine">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <polyline points="16 3 21 3 21 8"></polyline>
+                                <line x1="4" y1="20" x2="21" y2="3"></line>
+                                <polyline points="21 16 21 21 16 21"></polyline>
+                                <line x1="15" y1="15" x2="21" y2="21"></line>
+                                <line x1="4" y1="4" x2="9" y2="9"></line>
+                            </svg>
+                            <span>Export</span>
                         </button>
                         <button class="action-btn search-btn" id="chatSearchToggle">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -2729,6 +2746,27 @@
                 document.getElementById('refreshBtn').addEventListener('click', () => {
                     this.loadConversations();
                 });
+
+                // Export all sessions as a transfer bundle
+                const exportAllBtn = document.getElementById('exportAllBtn');
+                if (exportAllBtn) {
+                    exportAllBtn.addEventListener('click', () => exportAllSessions());
+                }
+
+                // Import a package or bundle; reload the list afterwards so it appears
+                const importBtn = document.getElementById('importBtn');
+                const importFileInput = document.getElementById('importFileInput');
+                if (importBtn && importFileInput) {
+                    importBtn.addEventListener('click', () => importFileInput.click());
+                    importFileInput.addEventListener('change', async (e) => {
+                        const file = e.target.files && e.target.files[0];
+                        e.target.value = ''; // allow re-selecting the same file later
+                        if (file) {
+                            await importSessionsFromFile(file);
+                            this.loadConversations();
+                        }
+                    });
+                }
 
                 // Include subagents toggle - reload when changed
                 const subagentCheckbox = document.getElementById('includeSubagentsCheckbox');
@@ -5667,6 +5705,128 @@
         function closeDownloadModal() {
             const downloadModal = document.getElementById('downloadModal');
             downloadModal.classList.remove('show');
+        }
+
+        // Export the current session as a lossless, resumable package (.ccsession.json).
+        // Unlike Download (markdown context), this can be imported on another machine
+        // and continued with `claude --resume`.
+        async function exportSessionForTransfer() {
+            const downloadBtn = document.getElementById('downloadConversation');
+            const conversationId = downloadBtn && downloadBtn.getAttribute('data-conversation-id');
+            if (!conversationId) {
+                console.error('No conversation ID found');
+                return;
+            }
+
+            const btn = document.getElementById('exportSessionTransfer');
+            const label = btn && btn.querySelector('span');
+            const original = label ? label.textContent : '';
+            if (label) label.textContent = 'Exporting…';
+            if (btn) btn.disabled = true;
+
+            try {
+                const response = await fetch(`/api/conversations/${conversationId}/export-session`);
+                if (!response.ok) {
+                    throw new Error(`Failed to export session: ${response.statusText}`);
+                }
+                // Endpoint sets a Content-Disposition filename; honor it if present.
+                const disposition = response.headers.get('Content-Disposition') || '';
+                const match = disposition.match(/filename="?([^"]+)"?/);
+                const filename = match ? match[1] : `claude-session-${conversationId.slice(0, 8)}.ccsession.json`;
+
+                const blob = await response.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                window.URL.revokeObjectURL(url);
+                document.body.removeChild(a);
+
+                console.log(`⇄ Exported resumable session: ${filename}`);
+                if (label) label.textContent = 'Exported ✓';
+                setTimeout(() => { if (label) label.textContent = original; }, 2000);
+            } catch (error) {
+                console.error('Error exporting session for transfer:', error);
+                if (label) label.textContent = 'Failed';
+                setTimeout(() => { if (label) label.textContent = original; }, 2000);
+            } finally {
+                if (btn) btn.disabled = false;
+            }
+        }
+
+        // Export ALL sessions into a single portable bundle for whole-history transfer.
+        async function exportAllSessions() {
+            const btn = document.getElementById('exportAllBtn');
+            const original = btn ? btn.textContent : '';
+            if (btn) { btn.disabled = true; btn.textContent = 'Bundling…'; }
+            try {
+                const response = await fetch('/api/export-all');
+                if (!response.ok) throw new Error(`Export failed: ${response.statusText}`);
+                const disposition = response.headers.get('Content-Disposition') || '';
+                const match = disposition.match(/filename="?([^"]+)"?/);
+                const filename = match ? match[1] : `claude-sessions-bundle-${new Date().toISOString().split('T')[0]}.ccbundle.json`;
+
+                const blob = await response.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                window.URL.revokeObjectURL(url);
+                document.body.removeChild(a);
+
+                console.log(`📦 Exported bundle: ${filename}`);
+                if (btn) btn.textContent = 'Exported ✓';
+            } catch (error) {
+                console.error('Error exporting all sessions:', error);
+                if (btn) btn.textContent = 'Failed';
+            } finally {
+                setTimeout(() => { if (btn) { btn.textContent = original; btn.disabled = false; } }, 2000);
+            }
+        }
+
+        // Import a .ccsession.json package or a .ccbundle.json bundle onto this machine.
+        async function importSessionsFromFile(file) {
+            const btn = document.getElementById('importBtn');
+            const original = btn ? btn.textContent : '';
+            if (btn) { btn.disabled = true; btn.textContent = 'Importing…'; }
+            try {
+                const text = await file.text();
+                let payload;
+                try {
+                    payload = JSON.parse(text);
+                } catch (e) {
+                    throw new Error('Selected file is not valid JSON');
+                }
+
+                const response = await fetch('/api/import', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await response.json();
+                if (!response.ok || data.error) {
+                    throw new Error(data.message || data.error || response.statusText);
+                }
+
+                if (data.kind === 'bundle') {
+                    console.log(`✅ Imported ${data.imported} of ${data.total} session(s), skipped ${data.skipped}`);
+                    alert(`Imported ${data.imported} of ${data.total} session(s).` + (data.skipped ? ` Skipped ${data.skipped} (see console/log).` : ''));
+                } else {
+                    console.log(`✅ Imported session ${data.sessionId}`);
+                    alert(`Imported session.\nResume with:\n  cd ${data.targetCwd}\n  claude --resume ${data.sessionId}`);
+                }
+                if (btn) btn.textContent = 'Imported ✓';
+            } catch (error) {
+                console.error('Error importing sessions:', error);
+                alert('Import failed: ' + error.message);
+                if (btn) btn.textContent = 'Failed';
+            } finally {
+                setTimeout(() => { if (btn) { btn.textContent = original; btn.disabled = false; } }, 2000);
+            }
         }
 
         async function proceedWithDownload() {
