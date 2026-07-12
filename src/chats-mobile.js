@@ -133,7 +133,8 @@ class ChatsMobile {
    * Setup Express middleware
    */
   setupMiddleware() {
-    this.app.use(express.json());
+    // Generous limit: session import bundles (whole-history transfers) can be large.
+    this.app.use(express.json({ limit: '500mb' }));
     
     // Serve static files from analytics-web directory (for services, components, etc.)
     this.app.use('/services', express.static(path.join(__dirname, 'analytics-web', 'services')));
@@ -611,6 +612,89 @@ class ChatsMobile {
           error: 'Failed to export session',
           message: error.message
         });
+      }
+    });
+
+    // API to download a conversation as a lossless, resumable session package.
+    // Unlike the markdown /download route, this preserves every field so the
+    // session can be imported and resumed on another machine via session-io.js.
+    this.app.get('/api/conversations/:id/export-session', async (req, res) => {
+      try {
+        const conversationId = req.params.id;
+        const conversation = this.data.conversations.find(conv => conv.id === conversationId);
+
+        if (!conversation) {
+          return res.status(404).json({ error: 'Conversation not found' });
+        }
+
+        const pkg = await this.sessionSharing.exportSessionRaw({
+          filePath: conversation.filePath,
+          sessionId: conversationId,
+          project: conversation.project
+        });
+
+        const safeProject = (pkg.source.project || 'session').replace(/[^a-zA-Z0-9-_]/g, '-');
+        const filename = `claude-session-${safeProject}-${conversationId.slice(0, 8)}.ccsession.json`;
+
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.send(JSON.stringify(pkg, null, 2));
+      } catch (error) {
+        console.error('Error exporting resumable session:', error);
+        res.status(500).json({ error: 'Failed to export session', message: error.message });
+      }
+    });
+
+    // API to export ALL sessions as a single portable bundle (whole-history transfer).
+    this.app.get('/api/export-all', async (req, res) => {
+      try {
+        console.log(chalk.cyan('📦 Exporting all sessions as a transfer bundle...'));
+        const bundle = await this.sessionSharing.exportAllSessions();
+
+        const date = new Date().toISOString().split('T')[0];
+        const filename = `claude-sessions-bundle-${date}.ccbundle.json`;
+        console.log(chalk.green(`✅ Bundled ${bundle.sessionCount} session(s)`));
+
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.send(JSON.stringify(bundle));
+      } catch (error) {
+        console.error('Error exporting all sessions:', error);
+        res.status(500).json({ error: 'Failed to export all sessions', message: error.message });
+      }
+    });
+
+    // API to import a session package or a whole-history bundle onto THIS machine.
+    // Writes into ~/.claude/projects so imported sessions can be resumed here.
+    this.app.post('/api/import', async (req, res) => {
+      try {
+        const payload = req.body || {};
+        const options = payload.options || {};
+
+        let result;
+        if (payload.format === 'claude-code-session-bundle' || Array.isArray(payload.sessions)) {
+          result = await this.sessionSharing.importBundle(payload, options);
+          console.log(chalk.green(`✅ Imported ${result.imported} session(s), skipped ${result.skipped}`));
+          res.json({ success: true, kind: 'bundle', ...result });
+        } else if (Array.isArray(payload.lines)) {
+          // Default to the session's own recorded cwd so it lands in the right project
+          // folder (the UI has no cwd picker); callers can still override via options.
+          const singleOpts = { ...options };
+          if (!singleOpts.targetCwd && payload.source && payload.source.cwd) {
+            singleOpts.targetCwd = payload.source.cwd;
+          }
+          if (!singleOpts.targetCwd) {
+            return res.status(400).json({ error: 'This session has no recorded cwd; import it via the CLI with --cwd <path>.' });
+          }
+          result = await this.sessionSharing.importSession(payload, singleOpts);
+          console.log(chalk.green(`✅ Imported session ${result.sessionId}`));
+          res.json({ success: true, kind: 'session', ...result });
+        } else {
+          return res.status(400).json({ error: 'Unrecognized import payload (expected a .ccsession.json package or a .ccbundle.json bundle)' });
+        }
+      } catch (error) {
+        console.error('Error importing session(s):', error);
+        res.status(500).json({ error: 'Failed to import', message: error.message });
       }
     });
 
